@@ -35,10 +35,26 @@ const {
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
+const http = require('http');
 const { findUnsavedNumbers, buildVcf } = require('./contacts');
 
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
 const PHONE_NUMBER = process.env.PHONE_NUMBER; // e.g. "2348012345678"
+
+// --- Railway needs something listening on $PORT, or its healthcheck ---
+// --- marks the deploy unhealthy and restarts/kills the container.  ---
+const PORT = process.env.PORT || 3000;
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('MATCH Contact Bot is running.\n');
+  })
+  .listen(PORT, () => console.log(`Healthcheck server listening on port ${PORT}`));
+
+// --- Baileys no longer ships an internal contact store (sock.store  ---
+// --- is undefined in current versions), so we build our own from   ---
+// --- the events it emits.                                          ---
+const contactStore = {};
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
@@ -75,6 +91,19 @@ async function startBot() {
   }
 
   sock.ev.on('creds.update', saveCreds);
+
+  // Keep our own contact map up to date (replaces the removed sock.store)
+  sock.ev.on('contacts.upsert', (contacts) => {
+    for (const c of contacts) contactStore[c.id] = c;
+  });
+  sock.ev.on('contacts.set', ({ contacts }) => {
+    for (const c of contacts) contactStore[c.id] = c;
+  });
+  sock.ev.on('contacts.update', (updates) => {
+    for (const u of updates) {
+      contactStore[u.id] = { ...(contactStore[u.id] || {}), ...u };
+    }
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update;
@@ -129,10 +158,13 @@ async function startBot() {
  * .vcf file. Uses the tested logic in contacts.js.
  */
 async function buildUnsavedContactsVcf(sock) {
-  const contacts = sock.store?.contacts || {};
-  const unsaved = findUnsavedNumbers(contacts);
+  const unsaved = findUnsavedNumbers(contactStore);
   const content = buildVcf(unsaved);
   return { content, count: unsaved.length };
 }
 
 startBot().catch((err) => console.error('Failed to start bot:', err));
+
+// Don't let one bad event silently crash the whole container
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
+process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
