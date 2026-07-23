@@ -1,5 +1,5 @@
 /**
- * MATCH Contact Bot - Stable Version
+ * MATCH Contact Bot - Super Stable Version
  */
 
 const {
@@ -25,88 +25,79 @@ http.createServer((req, res) => {
 const contactStore = {};
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
-  const { version } = await fetchLatestBaileysVersion();
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+    const { version } = await fetchLatestBaileysVersion();
 
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
-  });
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({ level: 'silent' }),
+      printQRInTerminal: false,
+    });
 
-  if (!PHONE_NUMBER) {
-    console.error('\n❌ Set the PHONE_NUMBER environment variable and restart.\n');
-    process.exit(1);
-  }
-
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('contacts.upsert', (contacts) => {
-    for (const c of contacts) contactStore[c.id] = c;
-  });
-  sock.ev.on('contacts.set', ({ contacts }) => {
-    for (const c of contacts) contactStore[c.id] = c;
-  });
-  sock.ev.on('contacts.update', (updates) => {
-    for (const u of updates) {
-      contactStore[u.id] = { ...(contactStore[u.id] || {}), ...u };
+    if (!PHONE_NUMBER) {
+      console.error('\n❌ Set PHONE_NUMBER env var!\n');
+      process.exit(1);
     }
-  });
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect } = update;
+    sock.ev.on('creds.update', saveCreds);
 
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Connection closed. Reconnecting:', shouldReconnect);
-      if (shouldReconnect) setTimeout(() => startBot(), 5000);
-    } else if (connection === 'open') {
-      console.log('✅ Bot is live and connected!');
-    }
-  });
-
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg?.message || msg.key.fromMe !== true) return;
-
-    let text = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.text || '';
-
-    console.log('Received self message:', text.trim());
-
-    if (text.trim().toLowerCase() === 'export') {
-      const ownJid = msg.key.remoteJid;
-      console.log('Export command detected!');
-
-      await sock.sendMessage(ownJid, { text: '🔍 Scanning for unsaved contacts...' });
-
-      try {
-        const unsaved = findUnsavedNumbers(contactStore);
-        const content = buildVcf(unsaved);
-        const count = unsaved.length;
-
-        console.log(`Found ${count} unsaved contacts`);
-
-        if (count === 0) {
-          await sock.sendMessage(ownJid, { text: 'No unsaved contacts found!' });
-          return;
-        }
-
-        await sock.sendMessage(ownJid, {
-          document: Buffer.from(content, 'utf-8'),
-          fileName: 'MATCH-contacts.vcf',
-          mimetype: 'text/vcard',
-        });
-
-        await sock.sendMessage(ownJid, {
-          text: `✅ Exported ${count} unsaved contacts! Tap the file to import.`,
-        });
-      } catch (err) {
-        console.error('Export error:', err);
-        await sock.sendMessage(ownJid, { text: '❌ Export failed.' });
+    sock.ev.on('contacts.upsert', (contacts) => {
+      for (const c of contacts) contactStore[c.id] = c;
+    });
+    sock.ev.on('contacts.set', ({ contacts }) => {
+      for (const c of contacts) contactStore[c.id] = c;
+    });
+    sock.ev.on('contacts.update', (updates) => {
+      for (const u of updates) {
+        contactStore[u.id] = { ...(contactStore[u.id] || {}), ...u };
       }
-    }
-  });
+    });
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect } = update;
+      if (connection === 'close') {
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        console.log('Connection closed. Reconnecting:', shouldReconnect);
+        if (shouldReconnect) setTimeout(() => startBot(), 5000);
+      } else if (connection === 'open') {
+        console.log('✅ Bot is live and connected!');
+      }
+    });
+
+    sock.ev.on('messages.upsert', async ({ messages }) => {
+      const msg = messages[0];
+      if (!msg?.message || msg.key.fromMe !== true) return;
+
+      let text = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.text || '';
+      if (text.trim().toLowerCase() === 'export') {
+        const ownJid = msg.key.remoteJid;
+        await sock.sendMessage(ownJid, { text: '🔍 Scanning...' });
+
+        try {
+          const unsaved = findUnsavedNumbers(contactStore);
+          const content = buildVcf(unsaved);
+          if (unsaved.length === 0) {
+            await sock.sendMessage(ownJid, { text: 'No unsaved contacts found!' });
+            return;
+          }
+          await sock.sendMessage(ownJid, {
+            document: Buffer.from(content, 'utf-8'),
+            fileName: 'MATCH-contacts.vcf',
+            mimetype: 'text/vcard',
+          });
+          await sock.sendMessage(ownJid, { text: `✅ Exported ${unsaved.length} contacts!` });
+        } catch (err) {
+          console.error('Export error:', err);
+          await sock.sendMessage(ownJid, { text: '❌ Export failed.' });
+        }
+      }
+    });
+
+  } catch (err) {
+    console.error('Critical startup error:', err);
+  }
 }
 
 startBot().catch((err) => console.error('Failed to start bot:', err));
