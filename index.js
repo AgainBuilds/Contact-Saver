@@ -25,6 +25,11 @@
  *      WhatsApp on their phone > Settings > Linked Devices > Link a
  *      Device > "Link with phone number instead" > enters that code.
  *   5. Leave it running (deploy to Railway/Render for 24/7 uptime).
+ *
+ *   NOTE: if you need a fresh pairing code (e.g. you unlinked the
+ *   device from WhatsApp, or auth got stale), delete the auth_info/
+ *   folder before restarting — otherwise the bot thinks it's already
+ *   registered and won't print a new code.
  */
 
 const {
@@ -35,10 +40,12 @@ const {
 } = require('@whiskeysockets/baileys');
 const pino = require('pino');
 const path = require('path');
+const fs = require('fs');
 const http = require('http');
 const { findUnsavedNumbers, buildVcf } = require('./contacts');
 
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
+const STORE_FILE = path.join(__dirname, 'store.json');
 const PHONE_NUMBER = process.env.PHONE_NUMBER; // e.g. "2348012345678"
 
 // --- Railway needs something listening on $PORT, or its healthcheck ---
@@ -53,11 +60,45 @@ http
 
 // --- Baileys no longer ships an internal contact store (sock.store  ---
 // --- is undefined in current versions), so we build our own from   ---
-// --- the events it emits.                                          ---
-const contactStore = {};
+// --- the events it emits. Persisted to disk because WhatsApp only  ---
+// --- sends the full messaging-history.set sync once, right after  ---
+// --- the initial pairing — not on every reconnect. Without         ---
+// --- persistence, a restart wipes out everything except chats/     ---
+// --- contacts seen live after that restart.                        ---
+function loadStore() {
+  try {
+    const raw = fs.readFileSync(STORE_FILE, 'utf-8');
+    const data = JSON.parse(raw);
+    return {
+      chats: new Set(data.chats || []),
+      contacts: data.contacts || {},
+    };
+  } catch {
+    return { chats: new Set(), contacts: {} };
+  }
+}
+
+const loaded = loadStore();
+const contactStore = loaded.contacts;
 // Every 1:1 chat JID we know about — this is what catches someone who
 // only ever messaged you, since they may never trigger a contacts event.
-const chatStore = new Set();
+const chatStore = loaded.chats;
+
+let saveTimer = null;
+function saveStoreDebounced() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    try {
+      fs.writeFileSync(
+        STORE_FILE,
+        JSON.stringify({ chats: [...chatStore], contacts: contactStore })
+      );
+    } catch (err) {
+      console.error('Failed to persist store:', err);
+    }
+  }, 2000); // batch rapid-fire events into one write
+}
 
 async function startBot() {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
@@ -99,37 +140,45 @@ async function startBot() {
   // Keep our own contact map up to date (replaces the removed sock.store)
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const c of contacts) contactStore[c.id] = c;
+    saveStoreDebounced();
   });
   sock.ev.on('contacts.set', ({ contacts }) => {
     for (const c of contacts) contactStore[c.id] = c;
+    saveStoreDebounced();
   });
   sock.ev.on('contacts.update', (updates) => {
     for (const u of updates) {
       contactStore[u.id] = { ...(contactStore[u.id] || {}), ...u };
     }
+    saveStoreDebounced();
   });
 
   // Track every known chat JID — catches numbers that only ever messaged
   // you, which never show up via contacts.* events alone.
   sock.ev.on('chats.set', ({ chats }) => {
     for (const c of chats) chatStore.add(c.id);
+    saveStoreDebounced();
   });
   sock.ev.on('chats.upsert', (chats) => {
     for (const c of chats) chatStore.add(c.id);
+    saveStoreDebounced();
   });
   // One-time payload WhatsApp sends after linking with the account's
   // existing chats/contacts/messages — this is what actually surfaces
-  // chats that existed before the bot connected.
+  // chats that existed before the bot connected. Only fires reliably
+  // right after initial pairing, which is why we persist the result.
   sock.ev.on('messaging-history.set', ({ chats, contacts }) => {
     for (const c of chats || []) chatStore.add(c.id);
     for (const c of contacts || []) contactStore[c.id] = { ...(contactStore[c.id] || {}), ...c };
     console.log(`History sync received: ${chats?.length || 0} chats, ${contacts?.length || 0} contacts.`);
+    saveStoreDebounced();
   });
   // Also track chat JIDs from any message we happen to see, as a fallback.
   sock.ev.on('messages.upsert', ({ messages }) => {
     for (const m of messages) {
       if (m.key?.remoteJid) chatStore.add(m.key.remoteJid);
     }
+    saveStoreDebounced();
   });
 
   sock.ev.on('connection.update', (update) => {
