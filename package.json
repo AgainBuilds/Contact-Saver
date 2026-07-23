@@ -1,0 +1,17 @@
+{
+  "name": "match-contact-bot",
+  "version": "1.0.0",
+  "description": "Connects to a WhatsApp account (with the owner's own pairing-code approval) and exports unsaved contacts as a MATCH 1, MATCH 2... .vcf file for easy import.",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.9",
+    "pino": "^9.4.0"
+  }
+}
