@@ -1,6 +1,5 @@
 /**
- * MATCH Contact Bot - Final Fixed Version
- * For WhatsApp TV / Channel Owners
+ * MATCH Contact Bot - Stable Version
  */
 
 const {
@@ -37,13 +36,12 @@ async function startBot() {
   });
 
   if (!PHONE_NUMBER) {
-    console.error('\n❌ Set the PHONE_NUMBER environment variable (e.g. 2348012345678) and restart.\n');
+    console.error('\n❌ Set the PHONE_NUMBER environment variable and restart.\n');
     process.exit(1);
   }
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Contact store management
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const c of contacts) contactStore[c.id] = c;
   });
@@ -68,22 +66,19 @@ async function startBot() {
     }
   });
 
-  // Export Handler
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
     if (!msg?.message || msg.key.fromMe !== true) return;
 
-    let text = msg.message.conversation || 
-               msg.message.extendedTextMessage?.text || 
-               msg.message.text || '';
+    let text = msg.message.conversation || msg.message.extendedTextMessage?.text || msg.message.text || '';
 
     console.log('Received self message:', text.trim());
 
     if (text.trim().toLowerCase() === 'export') {
       const ownJid = msg.key.remoteJid;
-      console.log('Export command detected! Starting scan...');
+      console.log('Export command detected!');
 
-      await sock.sendMessage(ownJid, { text: '🔍 Scanning all chats for unsaved contacts...' });
+      await sock.sendMessage(ownJid, { text: '🔍 Scanning for unsaved contacts...' });
 
       try {
         const unsaved = findUnsavedNumbers(contactStore);
@@ -93,7 +88,7 @@ async function startBot() {
         console.log(`Found ${count} unsaved contacts`);
 
         if (count === 0) {
-          await sock.sendMessage(ownJid, { text: 'No unsaved contacts found. Everything is already saved!' });
+          await sock.sendMessage(ownJid, { text: 'No unsaved contacts found!' });
           return;
         }
 
@@ -104,11 +99,11 @@ async function startBot() {
         });
 
         await sock.sendMessage(ownJid, {
-          text: `✅ Done! Found and exported ${count} unsaved contact(s).\nLabeled MATCH 1 to MATCH ${count}.\nTap the file to import.`,
+          text: `✅ Exported ${count} unsaved contacts! Tap the file to import.`,
         });
       } catch (err) {
         console.error('Export error:', err);
-        await sock.sendMessage(ownJid, { text: '❌ Export failed. Check server logs.' });
+        await sock.sendMessage(ownJid, { text: '❌ Export failed.' });
       }
     }
   });
