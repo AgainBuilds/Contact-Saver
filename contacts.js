@@ -40,8 +40,8 @@ function findUnsavedNumbers(chatStore, contactStore) {
     const isNumberLike = /^[\+]?[\d\s\-\(\)]{7,}$/.test(displayName);
 
     // Strict unsaved check
-    const isUnsaved = !displayName || 
-                     displayName === numberWithPlus || 
+    const isUnsaved = !displayName ||
+                     displayName === numberWithPlus ||
                      displayName === number ||
                      isNumberLike ||
                      possibleNames.some(name => name === numberWithPlus || name === number);
@@ -65,7 +65,7 @@ function buildVcf(unsaved) {
   let vcfContent = '';
   unsaved.forEach((contact, index) => {
     const tvName = `TV ${index + 1}`;
-    vcfContent += `BEGIN:VCARD\nVERSION:3.0\nFN:\( {tvName}\nTEL;type=CELL: \){contact.number}\nEND:VCARD\n`;
+    vcfContent += `BEGIN:VCARD\nVERSION:3.0\nFN:${tvName}\nTEL;type=CELL:${contact.number}\nEND:VCARD\n`;
   });
   return vcfContent;
 }
