@@ -7,102 +7,199 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const path = require('path');
-const http = require('http');
-const { findUnsavedNumbers, buildVcf } = require('./contacts');
+} = require("@whiskeysockets/baileys");
 
-const AUTH_FOLDER = path.join(__dirname, 'auth_info');
+const pino = require("pino");
+const path = require("path");
+const http = require("http");
+
+const { findUnsavedNumbers, buildVcf } = require("./contacts");
+
+const AUTH_FOLDER = path.join(__dirname, "auth_info");
 const PHONE_NUMBER = process.env.PHONE_NUMBER?.trim();
 
-const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('MATCH Contact Bot is running.\n');
-}).listen(PORT, () => console.log(`Healthcheck server listening on port ${PORT}`));
+const PORT = process.env.PORT || 8080;
+
+http
+  .createServer((req, res) => {
+    res.writeHead(200, {
+      "Content-Type": "text/plain",
+    });
+    res.end("MATCH Contact Bot is running.\n");
+  })
+  .listen(PORT, () => {
+    console.log(`Healthcheck server listening on port ${PORT}`);
+  });
 
 const contactStore = {};
 
 async function startBot() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
-  const { version } = await fetchLatestBaileysVersion();
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    logger: pino({ level: 'silent' }),
-    printQRInTerminal: false,
-  });
-
-  if (!PHONE_NUMBER) {
-    console.error('\n❌ Set the PHONE_NUMBER environment variable (international format) and restart.\n');
-    process.exit(1);
-  }
-
-  sock.ev.on('creds.update', saveCreds);
-
-  // Keep contact store updated
-  sock.ev.on('contacts.upsert', (contacts) => {
-    for (const c of contacts) contactStore[c.id] = c;
-  });
-  sock.ev.on('contacts.set', ({ contacts }) => {
-    for (const c of contacts) contactStore[c.id] = c;
-  });
-  sock.ev.on('contacts.update', (updates) => {
-    for (const u of updates) {
-      contactStore[u.id] = { ...(contactStore[u.id] || {}), ...u };
+  try {
+    if (!PHONE_NUMBER) {
+      throw new Error(
+        "PHONE_NUMBER environment variable is missing."
+      );
     }
-  });
 
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
-    if (connection === 'close') {
-      const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log('Connection closed. Reconnecting:', shouldReconnect);
-      if (shouldReconnect) setTimeout(() => startBot(), 5000);
-    } else if (connection === 'open') {
-      console.log('✅ Bot is live and connected!');
-    }
-  });
+    console.log("Loading auth state...");
 
-  // Export command
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    const msg = messages[0];
-    if (!msg?.message || msg.key.fromMe !== true) return;
+    const { state, saveCreds } =
+      await useMultiFileAuthState(AUTH_FOLDER);
 
-    const text = msg.message.conversation || msg.message.extendedTextMessage?.text || '';
-    if (text.trim().toLowerCase() === 'export') {
-      const ownJid = msg.key.remoteJid;
-      await sock.sendMessage(ownJid, { text: '🔍 Scanning your chats for unsaved contacts...' });
+    console.log("Fetching latest WhatsApp version...");
+
+    const { version } =
+      await fetchLatestBaileysVersion();
+
+    console.log("Creating socket...");
+
+    const sock = makeWASocket({
+      version,
+      auth: state,
+      logger: pino({
+        level: "info",
+      }),
+      printQRInTerminal: false,
+    });
+
+    sock.ev.on("creds.update", saveCreds);
+
+    // Generate pairing code on first login
+    if (!state.creds.registered) {
+      console.log("Requesting pairing code...");
 
       try {
-        const unsaved = findUnsavedNumbers(contactStore);
-        const content = buildVcf(unsaved);
-        const count = unsaved.length;
+        const code = await sock.requestPairingCode(
+          PHONE_NUMBER
+        );
 
-        if (count === 0) {
-          await sock.sendMessage(ownJid, { text: 'No unsaved contacts found — everything is already saved!' });
+        console.log("");
+        console.log("==============================");
+        console.log("PAIRING CODE:");
+        console.log(code);
+        console.log("==============================");
+        console.log("");
+      } catch (err) {
+        console.error(
+          "Failed to request pairing code:",
+          err
+        );
+      }
+    }
+
+    sock.ev.on("connection.update", (update) => {
+      console.log("Connection Update:", update);
+
+      const { connection, lastDisconnect } = update;
+
+      if (connection === "open") {
+        console.log("✅ Bot is live and connected!");
+      }
+
+      if (connection === "close") {
+        const shouldReconnect =
+          lastDisconnect?.error?.output?.statusCode !==
+          DisconnectReason.loggedOut;
+
+        console.log(
+          "Connection closed. Reconnect:",
+          shouldReconnect
+        );
+
+        if (shouldReconnect) {
+          setTimeout(startBot, 5000);
+        }
+      }
+    });
+
+    // Contact Store
+
+    sock.ev.on("contacts.upsert", (contacts) => {
+      contacts.forEach((c) => {
+        contactStore[c.id] = c;
+      });
+    });
+
+    sock.ev.on("contacts.set", ({ contacts }) => {
+      contacts.forEach((c) => {
+        contactStore[c.id] = c;
+      });
+    });
+
+    sock.ev.on("contacts.update", (updates) => {
+      updates.forEach((u) => {
+        contactStore[u.id] = {
+          ...(contactStore[u.id] || {}),
+          ...u,
+        };
+      });
+    });
+
+    // Listen for export command
+
+    sock.ev.on("messages.upsert", async ({ messages }) => {
+      const msg = messages[0];
+
+      if (!msg?.message) return;
+      if (!msg.key.fromMe) return;
+
+      const text =
+        msg.message.conversation ||
+        msg.message.extendedTextMessage?.text ||
+        "";
+
+      if (text.trim().toLowerCase() !== "export") return;
+
+      const ownJid = msg.key.remoteJid;
+
+      try {
+        await sock.sendMessage(ownJid, {
+          text: "🔍 Scanning your chats...",
+        });
+
+        const unsaved =
+          findUnsavedNumbers(contactStore);
+
+        if (!unsaved.length) {
+          await sock.sendMessage(ownJid, {
+            text: "No unsaved contacts found.",
+          });
           return;
         }
 
         await sock.sendMessage(ownJid, {
-          document: Buffer.from(content, 'utf-8'),
-          fileName: 'MATCH-contacts.vcf',
-          mimetype: 'text/vcard',
+          document: Buffer.from(
+            buildVcf(unsaved),
+            "utf8"
+          ),
+          fileName: "MATCH-contacts.vcf",
+          mimetype: "text/vcard",
         });
+
         await sock.sendMessage(ownJid, {
-          text: `✅ Done! Found \( {count} unsaved contact(s). Tap the file to import as MATCH 1– \){count}.`,
+          text: `✅ Done! Found ${unsaved.length} unsaved contact(s).`,
         });
       } catch (err) {
-        console.error('Export failed:', err);
-        await sock.sendMessage(ownJid, { text: 'Something went wrong — check logs.' });
+        console.error("Export failed:", err);
+
+        await sock.sendMessage(ownJid, {
+          text: "❌ Export failed. Check Railway logs.",
+        });
       }
-    }
-  });
+    });
+  } catch (err) {
+    console.error("Failed to start bot:", err);
+
+    setTimeout(startBot, 5000);
+  }
 }
 
-startBot().catch((err) => console.error('Failed to start bot:', err));
+startBot();
 
-process.on('unhandledRejection', (err) => console.error('Unhandled rejection:', err));
-process.on('uncaughtException', (err) => console.error('Uncaught exception:', err));
+process.on("unhandledRejection", (err) => {
+  console.error("Unhandled Rejection:", err);
+});
+
+process.on("uncaughtException", (err) => {
+  console.error("Uncaught Exception:", err);
+});
