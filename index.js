@@ -153,7 +153,7 @@ async function startBot() {
   });
 }
 
-/**
+/*
  * Scans the live contact store, finds unsaved numbers, and builds the
  * .vcf file. Uses the tested logic in contacts.js.
  */
