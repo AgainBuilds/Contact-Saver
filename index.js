@@ -1,5 +1,6 @@
 /**
- * MATCH Contact Bot (Fixed for Railway + Pairing Issues)
+ * MATCH Contact Bot - Pairing Code Only (Optimized for Third-Party)
+ * Owner links via phone number, no QR needed.
  */
 
 const {
@@ -17,14 +18,16 @@ const AUTH_FOLDER = path.join(__dirname, 'auth_info');
 const PHONE_NUMBER = process.env.PHONE_NUMBER?.trim(); // e.g. "2348012345678"
 
 const PORT = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('MATCH Contact Bot is running.\n');
-}).listen(PORT, () => console.log(`Healthcheck server listening on port ${PORT}`));
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end('MATCH Contact Bot is running.\n');
+  })
+  .listen(PORT, () => console.log(`Healthcheck server listening on port ${PORT}`));
 
 const contactStore = {};
 
-async function startBot() {
+async function startBot(retryCount = 0) {
   const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
   const { version } = await fetchLatestBaileysVersion();
 
@@ -36,13 +39,13 @@ async function startBot() {
   });
 
   if (!PHONE_NUMBER) {
-    console.error('\n❌ Set the PHONE_NUMBER environment variable (international format, digits only) and restart.\n');
+    console.error('\n❌ Set the PHONE_NUMBER environment variable and restart.\n');
     process.exit(1);
   }
 
   sock.ev.on('creds.update', saveCreds);
 
-  // Contact store management
+  // Contact store
   sock.ev.on('contacts.upsert', (contacts) => {
     for (const c of contacts) contactStore[c.id] = c;
   });
@@ -61,52 +64,49 @@ async function startBot() {
     if (connection === 'close') {
       const statusCode = lastDisconnect?.error?.output?.statusCode;
       const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      console.log(`Connection closed (code: ${statusCode || 'unknown'}). Reconnecting: ${shouldReconnect}`);
-      if (shouldReconnect) {
-        setTimeout(() => startBot(), 3000);
+      console.log(`Connection closed (code: ${statusCode}). Reconnecting: ${shouldReconnect}`);
+      if (shouldReconnect && retryCount < 6) {
+        setTimeout(() => startBot(retryCount + 1), 6000);
       }
       return;
-    } 
-
-    if (connection === 'open') {
-      console.log('✅ Connected to WhatsApp. Bot is live!');
-      console.log('   Message yourself "export" to generate MATCH contacts.');
     }
 
-    // Pairing Code with retry (fixes Connection Closed)
-    if (!sock.authState?.creds?.registered && (connection === 'connecting' || !!qr)) {
-      let attempts = 0;
-      const maxAttempts = 3;
+    if (connection === 'open') {
+      console.log('✅ Connected to WhatsApp successfully!');
+      console.log('   Owner can now send "export" to themselves.');
+    }
 
-      const tryPairing = async () => {
+    // Pairing Code Request with delays
+    if (!sock.authState?.creds?.registered && (connection === 'connecting' || !!qr)) {
+      console.log('⏳ Waiting before requesting pairing code...');
+      await new Promise(r => setTimeout(r, 8000));
+
+      let attempts = 0;
+      const maxAttempts = 4;
+
+      while (attempts < maxAttempts) {
+        attempts++;
         try {
-          console.log(`🔄 Requesting pairing code (attempt \( {attempts + 1}/ \){maxAttempts})...`);
+          console.log(`🔄 Pairing attempt \( {attempts}/ \){maxAttempts}...`);
           const code = await sock.requestPairingCode(PHONE_NUMBER);
           console.log('\n================================');
           console.log('✅ PAIRING CODE:', code);
-          console.log('On your phone:');
-          console.log('WhatsApp → Settings → Linked Devices → Link a Device');
-          console.log('→ "Link with phone number instead" → enter the code');
+          console.log('Send this code to the account owner:');
+          console.log('WhatsApp → Settings → Linked Devices → "Link with phone number instead"');
           console.log('================================\n');
-          return true;
+          return; // Success
         } catch (err) {
-          attempts++;
-          console.error(`❌ Pairing attempt ${attempts} failed:`, err.message || err);
+          console.error(`❌ Attempt ${attempts} failed:`, err.message || err);
           if (attempts < maxAttempts) {
-            console.log(`Retrying in 4 seconds...`);
-            await new Promise(resolve => setTimeout(resolve, 4000));
-            return tryPairing();
+            await new Promise(r => setTimeout(r, 7000));
           }
-          console.error('❌ All pairing attempts failed.');
-          return false;
         }
-      };
-
-      await tryPairing();
+      }
+      console.error('❌ All pairing attempts failed. Check PHONE_NUMBER or try later.');
     }
   });
 
-  // Export command handler
+  // Export command
   sock.ev.on('messages.upsert', async ({ messages }) => {
     const msg = messages[0];
     if (!msg?.message || msg.key.fromMe !== true) return;
@@ -122,7 +122,7 @@ async function startBot() {
         const count = unsaved.length;
 
         if (!count) {
-          await sock.sendMessage(ownJid, { text: 'No unsaved contacts found — everything is already saved!' });
+          await sock.sendMessage(ownJid, { text: 'No unsaved contacts found!' });
           return;
         }
 
@@ -132,11 +132,11 @@ async function startBot() {
           mimetype: 'text/vcard',
         });
         await sock.sendMessage(ownJid, {
-          text: `✅ Done! Found \( {count} unsaved contact(s). Tap the file to import as MATCH 1– \){count}.`,
+          text: `✅ Found \( {count} unsaved contact(s)! Tap the file above to import as MATCH 1– \){count}.`,
         });
       } catch (err) {
         console.error('Export failed:', err);
-        await sock.sendMessage(ownJid, { text: 'Something went wrong — check server logs.' });
+        await sock.sendMessage(ownJid, { text: 'Export failed — check logs.' });
       }
     }
   });
