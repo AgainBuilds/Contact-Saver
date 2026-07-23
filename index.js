@@ -44,6 +44,9 @@ const fs = require('fs');
 const http = require('http');
 const { findUnsavedNumbers, buildVcf } = require('./contacts');
 
+// NOTE: no persistent volume yet, so these reset on every redeploy.
+// Fine for testing the detection logic in one continuous run; once
+// you're ready for 24/7 use you'll want these on a persistent disk.
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
 const STORE_FILE = path.join(__dirname, 'store.json');
 const PHONE_NUMBER = process.env.PHONE_NUMBER; // e.g. "2348012345678"
