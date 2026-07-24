@@ -60,6 +60,7 @@ function lookupContact(jid, number, contactStore, lidMap) {
 function findUnsavedNumbers(chatStore, contactStore, lidMap = {}) {
   const unsaved = [];
   const seenIdentities = new Set();
+  let skippedUnresolvedLid = 0;
 
   console.log(
     `[DEBUG] Total chats in store: ${chatStore.size} | Contacts in store: ${Object.keys(contactStore).length} | lid<->pn links: ${Object.keys(lidMap).length / 2}`
@@ -74,6 +75,20 @@ function findUnsavedNumbers(chatStore, contactStore, lidMap = {}) {
     // Collapse @lid chats to their real-number identity when we know the
     // mapping, so the same person isn't evaluated twice under two JIDs.
     const identityJid = resolveIdentityJid(jid, lidMap);
+
+    // A @lid JID we could NOT resolve to a real number has no dialable
+    // phone number behind it as far as we know — the digits in a @lid
+    // JID are an internal WhatsApp identifier, not a phone number. Export­
+    // ing them into the .vcf would produce a fake, unusable contact, so
+    // we skip these and just report how many were skipped. They'll
+    // resolve automatically once Baileys gives us the pn<->lid link
+    // (e.g. the person messages again, or shows up in a contacts sync).
+    if (identityJid.endsWith('@lid')) {
+      skippedUnresolvedLid += 1;
+      console.log(`[DEBUG] jid=${jid} -> SKIPPED (no known real number behind this @lid chat yet)`);
+      continue;
+    }
+
     if (seenIdentities.has(identityJid)) {
       console.log(`[DEBUG] jid=${jid} -> already evaluated as ${identityJid}, skipping duplicate`);
       continue;
@@ -110,7 +125,8 @@ function findUnsavedNumbers(chatStore, contactStore, lidMap = {}) {
     }
   }
 
-  console.log(`[DEBUG] Found ${unsaved.length} unsaved contacts.`);
+  console.log(`[DEBUG] Found ${unsaved.length} unsaved contacts. Skipped ${skippedUnresolvedLid} unresolved @lid chat(s).`);
+  unsaved.skippedUnresolvedLid = skippedUnresolvedLid;
   return unsaved;
 }
 
