@@ -1,21 +1,25 @@
 /**
  * contacts.js - Unsaved contact detection for MATCH Contact Bot
  *
- * WhatsApp's privacy mode ("linked ID") can represent the same person
- * as two different chat JIDs: their real number (@s.whatsapp.net) and
- * an opaque @lid identifier. The digits inside a @lid JID are NOT a
- * phone number — they're an internal identifier — so you cannot dedupe
- * or look up a saved name for a @lid chat just by normalizing it the
- * same way you would a real number.
+ * WhatsApp's LID (Local Identifier) system is now the default identity
+ * for chats (finalized in Baileys 7.x) — WhatsApp increasingly shows
+ * people as an opaque @lid JID instead of their real @s.whatsapp.net
+ * number, for privacy. The digits inside a @lid JID are NOT a phone
+ * number — they're an internal identifier — so a @lid chat can't be
+ * deduped or matched against your saved address book just by
+ * normalizing it the way you would a real number.
  *
- * If a contact is saved under their real number but you only ever see
- * them show up as a @lid chat, the old logic had no way to connect the
- * two and would flag them as "unsaved" even though they're saved.
- *
- * `lidMap` (built in index.js from contacts.upsert/set/update and from
- * message key remoteJid/remoteJidAlt pairs) bridges the two: it maps
- * lidJid -> pnJid and pnJid -> lidJid whenever Baileys hands us both
- * for the same person.
+ * Resolution order for a @lid chat, fastest/cheapest first:
+ *   1. Our own harvested map (built in index.js from Contact objects'
+ *      `phoneNumber`/`lid` fields, and from message keys'
+ *      `remoteJidAlt`/`participantAlt` — both confirmed fields as of
+ *      Baileys 7.x).
+ *   2. Baileys' own official LID<->PN store,
+ *      `sock.signalRepository.lidMapping.getPNForLID()` — passed in
+ *      here as `resolveLid`, an async function, since that store may
+ *      know a mapping ours hasn't seen yet.
+ * A @lid chat neither source can resolve is skipped from the export
+ * entirely rather than guessed at — see findUnsavedNumbers.
  */
 
 function normalizeJid(jid) {
@@ -26,24 +30,28 @@ function isPhoneNumberJid(jid) {
   return jid && (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid'));
 }
 
-// Given a chat JID, resolve it to its "identity key" — the @s.whatsapp.net
-// JID if we know one (via lidMap), otherwise the JID itself. This is what
-// we dedupe and look up contact info against, so a person seen under both
-// their lid and their real number collapses into ONE entry instead of two.
-function resolveIdentityJid(jid, lidMap) {
-  if (jid.endsWith('@lid') && lidMap && lidMap[jid] && lidMap[jid].endsWith('@s.whatsapp.net')) {
-    return lidMap[jid];
+// Resolves a chat JID to its "identity JID" — the real @s.whatsapp.net
+// JID if we can find one, otherwise the original JID unchanged (still
+// @lid if unresolved). This is what we dedupe and look up saved-contact
+// info against, so a person seen under both their lid and their real
+// number collapses into ONE entry instead of two.
+async function resolveIdentityJid(jid, resolveLid) {
+  if (!jid.endsWith('@lid')) return jid;
+  if (typeof resolveLid !== 'function') return jid;
+  try {
+    const pnJid = await resolveLid(jid);
+    if (pnJid && pnJid.endsWith('@s.whatsapp.net')) return pnJid;
+  } catch (err) {
+    console.log(`[DEBUG] resolveLid threw for ${jid}:`, err?.message || err);
   }
-  return jid;
+  return jid; // still unresolved
 }
 
-// Looks up a contact record for a JID, trying the JID itself, its lid/pn
-// counterpart (if mapped), and the plain number under both suffixes.
-function lookupContact(jid, number, contactStore, lidMap) {
-  const candidates = [jid];
-  if (lidMap && lidMap[jid]) candidates.push(lidMap[jid]);
-  candidates.push(`${number}@s.whatsapp.net`, `${number}@lid`);
-
+// Looks up a contact record for an already-resolved identity JID,
+// trying the JID itself and the plain number under both suffixes
+// (covers cases where the contact store only ever saw one form).
+function lookupContact(identityJid, number, contactStore) {
+  const candidates = [identityJid, `${number}@s.whatsapp.net`, `${number}@lid`];
   for (const candidate of candidates) {
     if (contactStore[candidate]) return contactStore[candidate];
   }
@@ -57,13 +65,13 @@ function lookupContact(jid, number, contactStore, lidMap) {
 // "named" but is not a saved contact. We keep them out of the identity
 // check for that reason; they're still shown in the debug log for
 // visibility.
-function findUnsavedNumbers(chatStore, contactStore, lidMap = {}) {
+async function findUnsavedNumbers(chatStore, contactStore, resolveLid) {
   const unsaved = [];
   const seenIdentities = new Set();
   let skippedUnresolvedLid = 0;
 
   console.log(
-    `[DEBUG] Total chats in store: ${chatStore.size} | Contacts in store: ${Object.keys(contactStore).length} | lid<->pn links: ${Object.keys(lidMap).length / 2}`
+    `[DEBUG] Total chats in store: ${chatStore.size} | Contacts in store: ${Object.keys(contactStore).length}`
   );
 
   for (const jid of chatStore) {
@@ -72,17 +80,13 @@ function findUnsavedNumbers(chatStore, contactStore, lidMap = {}) {
       continue;
     }
 
-    // Collapse @lid chats to their real-number identity when we know the
-    // mapping, so the same person isn't evaluated twice under two JIDs.
-    const identityJid = resolveIdentityJid(jid, lidMap);
+    const identityJid = await resolveIdentityJid(jid, resolveLid);
 
-    // A @lid JID we could NOT resolve to a real number has no dialable
-    // phone number behind it as far as we know — the digits in a @lid
-    // JID are an internal WhatsApp identifier, not a phone number. Export­
-    // ing them into the .vcf would produce a fake, unusable contact, so
-    // we skip these and just report how many were skipped. They'll
-    // resolve automatically once Baileys gives us the pn<->lid link
-    // (e.g. the person messages again, or shows up in a contacts sync).
+    // A @lid we could not resolve to a real number has no dialable
+    // phone number behind it as far as we currently know. Exporting
+    // its lid digits into the .vcf would produce a fake, unusable
+    // contact, so we skip it and just report a count — it'll resolve
+    // automatically as WhatsApp syncs more of the lid<->pn mapping.
     if (identityJid.endsWith('@lid')) {
       skippedUnresolvedLid += 1;
       console.log(`[DEBUG] jid=${jid} -> SKIPPED (no known real number behind this @lid chat yet)`);
@@ -98,7 +102,7 @@ function findUnsavedNumbers(chatStore, contactStore, lidMap = {}) {
     const number = normalizeJid(identityJid);
     if (!number) continue;
 
-    const contact = lookupContact(identityJid, number, contactStore, lidMap);
+    const contact = lookupContact(identityJid, number, contactStore);
 
     const savedName = (contact.name || '').trim();
     const otherNames = [contact.notify, contact.pushname, contact.verifiedName, contact.shortName]
@@ -139,4 +143,4 @@ function buildVcf(unsaved) {
   return vcfContent;
 }
 
-module.exports = { findUnsavedNumbers, buildVcf };
+export { findUnsavedNumbers, buildVcf };
