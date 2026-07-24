@@ -15,38 +15,52 @@
  * TV 1, TV 2, TV 3... and send back a ready-to-import .vcf file
  * right there in the chat.
  *
+ * Built for Baileys 7.x, which ships as ESM only and finalizes
+ * WhatsApp's LID (Local Identifier) privacy system — see the comments
+ * above the lid-handling functions below for what that means for
+ * contact detection.
+ *
  * SETUP:
  *   1. npm install
  *   2. Set the PHONE_NUMBER env var to the WhatsApp account's own
  *      number, in international format with no + or spaces, e.g.
  *      2348012345678
  *   3. npm start
- *   4. The console will print a pairing code. The account owner opens
- *      WhatsApp on their phone > Settings > Linked Devices > Link a
- *      Device > "Link with phone number instead" > enters that code.
+ *   4. The console prints an 8-character pairing code ONCE. Before
+ *      that happens, get your phone ready: WhatsApp > Settings >
+ *      Linked Devices > Link a Device > "Link with phone number
+ *      instead" > sitting on the empty code-entry screen, country set
+ *      to Nigeria (+234). The moment the code appears in the log, type
+ *      it in — these expire in well under a minute, and this bot does
+ *      NOT auto-retry the request (repeated pairing requests get
+ *      flagged by WhatsApp and can get the number's session hard-
+ *      closed, which shows up on the phone as "Couldn't link device").
  *   5. Leave it running (deploy to Railway/Render for 24/7 uptime).
  *
  *   NOTE: if you need a fresh pairing code (e.g. you unlinked the
  *   device from WhatsApp, or auth got stale), delete the auth_info/
  *   folder before restarting — otherwise the bot thinks it's already
- *   registered and won't print a new code.
+ *   registered and won't print a new code. On a fresh Railway
+ *   environment (no volume) this is already true on every deploy.
  */
 
-const {
-  default: makeWASocket,
+import makeWASocket, {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
-} = require('@whiskeysockets/baileys');
-const pino = require('pino');
-const path = require('path');
-const fs = require('fs');
-const http = require('http');
-const { findUnsavedNumbers, buildVcf } = require('./contacts');
+} from '@whiskeysockets/baileys';
+import pino from 'pino';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import fs from 'fs';
+import http from 'http';
+import { findUnsavedNumbers, buildVcf } from './contacts.js';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // NOTE: no persistent volume yet, so these reset on every redeploy.
 // Fine for testing the detection logic in one continuous run; once
-// you're ready for 24/7 use you'll want these on a persistent disk.
+// you're on a plan with a volume, point these at the mounted path.
 const AUTH_FOLDER = path.join(__dirname, 'auth_info');
 const STORE_FILE = path.join(__dirname, 'store.json');
 const PHONE_NUMBER = process.env.PHONE_NUMBER; // e.g. "2348012345678"
@@ -69,13 +83,10 @@ http
 // --- persistence, a restart wipes out everything except chats/     ---
 // --- contacts seen live after that restart.                        ---
 //
-// We also persist a lid <-> phone-number JID map. WhatsApp's privacy
-// mode ("linked ID") can show the SAME person as two different chats:
-// one under their real number (@s.whatsapp.net) and one under an
-// opaque @lid identifier. Without a mapping between the two, the bot
-// can't tell they're the same contact, so a saved contact can still
-// get flagged "unsaved" under their @lid JID. See contacts.js for how
-// this map is used.
+// We also persist our own lid <-> phone-number JID map, as a fast,
+// synchronous fallback ALONGSIDE Baileys' own official one
+// (sock.signalRepository.lidMapping, added as part of the 7.x LID
+// system finalization). See contacts.js for how the two are combined.
 function loadStore() {
   try {
     const raw = fs.readFileSync(STORE_FILE, 'utf-8');
@@ -122,27 +133,42 @@ function linkLidAndPn(lidJid, pnJid) {
   saveStoreDebounced();
 }
 
-// Pulls a lid<->pn pairing out of a contact object when Baileys gives us
-// one. Different Baileys versions expose this differently, so we check
-// a few known shapes defensively rather than assuming one.
+// Pulls a lid<->pn pairing out of a Contact object. As of Baileys 7.x
+// the Contact type has an `id` field (either a @lid or @s.whatsapp.net
+// JID) plus whichever of `phoneNumber` / `lid` is the OTHER form — e.g.
+// if `id` is a @lid, `phoneNumber` holds the real number, and vice
+// versa (per the 7.x migration notes).
 function harvestLidMapFromContact(c) {
   if (!c) return;
-  const pn = c.id && c.id.endsWith('@s.whatsapp.net') ? c.id : c.phoneNumber;
-  const lid = c.lid || (c.id && c.id.endsWith('@lid') ? c.id : undefined);
+  const idIsLid = c.id && c.id.endsWith('@lid');
+  const idIsPn = c.id && c.id.endsWith('@s.whatsapp.net');
+  const pn = idIsPn
+    ? c.id
+    : c.phoneNumber
+    ? c.phoneNumber.includes('@')
+      ? c.phoneNumber
+      : `${c.phoneNumber}@s.whatsapp.net`
+    : undefined;
+  const lid = idIsLid ? c.id : c.lid ? (c.lid.includes('@') ? c.lid : `${c.lid}@lid`) : undefined;
   if (pn && lid) linkLidAndPn(lid, pn);
 }
 
 // Pulls a lid<->pn pairing out of a message key when present. Baileys
-// attaches `remoteJidAlt` / `participantAlt` to messages routed through
-// the lid privacy layer, giving the "other" JID for the same chat.
+// 6.8+/7.x attaches `remoteJidAlt` (DMs) / `participantAlt` (groups) —
+// the alternate JID form for the same person — to messages routed
+// through the lid privacy layer.
 function harvestLidMapFromMessageKey(key) {
   if (!key) return;
-  const a = key.remoteJid;
-  const b = key.remoteJidAlt;
-  if (!a || !b) return;
-  const lid = a.endsWith('@lid') ? a : b.endsWith('@lid') ? b : undefined;
-  const pn = a.endsWith('@s.whatsapp.net') ? a : b.endsWith('@s.whatsapp.net') ? b : undefined;
-  if (lid && pn) linkLidAndPn(lid, pn);
+  const pairs = [
+    [key.remoteJid, key.remoteJidAlt],
+    [key.participant, key.participantAlt],
+  ];
+  for (const [a, b] of pairs) {
+    if (!a || !b) continue;
+    const lid = a.endsWith('@lid') ? a : b.endsWith('@lid') ? b : undefined;
+    const pn = a.endsWith('@s.whatsapp.net') ? a : b.endsWith('@s.whatsapp.net') ? b : undefined;
+    if (lid && pn) linkLidAndPn(lid, pn);
+  }
 }
 
 async function startBot() {
@@ -154,31 +180,29 @@ async function startBot() {
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false, // we use pairing code instead of QR
-    // IMPORTANT: full history sync loads your entire WhatsApp message
-    // history into memory at pairing time. On a real, active account
-    // this is easily enough to exceed Railway's free-tier memory limit,
-    // which gets the container OOM-killed and restarted mid-pairing —
-    // wiping auth_info before pairing can finish. We only need chat
-    // JIDs and contact names for this bot, not message content, so we
-    // leave this off. `messaging-history.set` still fires with chats
-    // and contacts either way; you just won't get old message bodies.
+    // Full history sync loads your entire WhatsApp message history into
+    // memory at pairing time — easily enough to exceed a free-tier
+    // memory limit and get the container OOM-killed mid-pairing. We
+    // only need chat JIDs and contact names, not message content, so
+    // this stays off. `messaging-history.set` still fires with chats
+    // and contacts either way.
     syncFullHistory: false,
+    // Without this, WhatsApp treats the linked session as "you're
+    // already active elsewhere" and can suppress phone notifications
+    // for messages — including the bot's own replies to "export".
+    // Keeping this false is what lets your phone actually notify you
+    // when the bot responds.
+    markOnlineOnConnect: false,
   });
 
   // --- Pairing code flow (no QR, no screen share needed) ---
-  // Requested exactly once, after a short fixed delay so the socket's
-  // handshake has time to get underway. See requestPairingCodeOnce()
-  // below for why this does NOT retry automatically.
+  // Requested EXACTLY ONCE per process run, after a short fixed delay
+  // so the socket's handshake has time to get underway. No automatic
+  // retry: WhatsApp treats repeated pairing-code requests for the same
+  // number in a short window as suspicious and will hard-close the
+  // session (a real logout, not a reconnectable network drop).
   let codeRequested = false;
 
-  // Request the pairing code EXACTLY ONCE per process run. WhatsApp
-  // treats repeated pairing-code requests for the same number in a
-  // short window as suspicious and will hard-close the session
-  // (a real logout, not a reconnectable network drop) — that's what
-  // a retry loop here was actually causing. A short fixed delay after
-  // socket creation (rather than reacting to connection.update, which
-  // can fire before the handshake is far enough along) is the pattern
-  // Baileys' own examples use, and is what this bot used originally.
   async function requestPairingCodeOnce() {
     if (codeRequested) return;
     codeRequested = true;
@@ -189,7 +213,8 @@ async function startBot() {
       console.log(' On the WhatsApp account owner\'s phone:');
       console.log(' Settings > Linked Devices > Link a Device');
       console.log(' > "Link with phone number instead" > enter this code');
-      console.log(' This code expires in ~60 seconds — enter it promptly.');
+      console.log(' This code expires in under a minute — have the phone');
+      console.log(' already sitting on the entry screen before this prints.');
       console.log('================================\n');
     } catch (err) {
       console.error(
@@ -268,6 +293,21 @@ async function startBot() {
     }
     saveStoreDebounced();
   });
+  // New in 7.x: WhatsApp occasionally pushes lid<->pn pairings directly.
+  // The library's own docs mark this event's exact shape as a work in
+  // progress ("not reported always"), so this is handled defensively —
+  // if the shape doesn't match what we expect, we just learn nothing
+  // from it rather than crashing.
+  sock.ev.on('lid-mapping.update', (update) => {
+    try {
+      const entries = Array.isArray(update) ? update : [update];
+      for (const u of entries) {
+        if (u?.lid && u?.pn) linkLidAndPn(u.lid, u.pn);
+      }
+    } catch (err) {
+      console.error('Failed to process lid-mapping.update:', err);
+    }
+  });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update;
@@ -288,8 +328,6 @@ async function startBot() {
         // Closed before pairing finished. Don't auto-restart — that
         // would silently fire another pairing-code request right
         // after this one, which is what gets a number rate-limited.
-        // Restart the process manually once you've entered a code
-        // (or want to try again).
         console.error(
           'Connection closed before pairing completed. Not auto-restarting — ' +
             'restart the process manually to request a new pairing code.'
@@ -348,10 +386,31 @@ async function startBot() {
 
 /**
  * Scans the live chat + contact stores, finds unsaved numbers, and
- * builds the .vcf file. Uses the tested logic in contacts.js.
+ * builds the .vcf file. Uses the tested logic in contacts.js, giving
+ * it both our own harvested lid<->pn map AND (as a fallback) Baileys'
+ * own official lid<->pn store for resolving @lid chats.
  */
 async function buildUnsavedContactsVcf(sock) {
-  const unsaved = findUnsavedNumbers(chatStore, contactStore, lidMap);
+  async function resolvePnForLid(lidJid) {
+    if (lidMap[lidJid]) return lidMap[lidJid];
+    try {
+      // Optional chaining throughout: this API is new as of the 7.x
+      // LID overhaul, and its exact shape could still shift across
+      // prerelease versions — if any part of it is missing, we just
+      // fall through to "unresolved" instead of throwing.
+      const pn = await sock.signalRepository?.lidMapping?.getPNForLID?.(lidJid);
+      if (pn) {
+        const pnJid = pn.includes('@') ? pn : `${pn}@s.whatsapp.net`;
+        linkLidAndPn(lidJid, pnJid);
+        return pnJid;
+      }
+    } catch (err) {
+      console.log(`[DEBUG] official lidMapping lookup failed for ${lidJid}:`, err?.message || err);
+    }
+    return undefined;
+  }
+
+  const unsaved = await findUnsavedNumbers(chatStore, contactStore, resolvePnForLid);
   const content = buildVcf(unsaved);
   return { content, count: unsaved.length, skippedUnresolvedLid: unsaved.skippedUnresolvedLid || 0 };
 }
