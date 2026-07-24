@@ -68,6 +68,14 @@ http
 // --- the initial pairing — not on every reconnect. Without         ---
 // --- persistence, a restart wipes out everything except chats/     ---
 // --- contacts seen live after that restart.                        ---
+//
+// We also persist a lid <-> phone-number JID map. WhatsApp's privacy
+// mode ("linked ID") can show the SAME person as two different chats:
+// one under their real number (@s.whatsapp.net) and one under an
+// opaque @lid identifier. Without a mapping between the two, the bot
+// can't tell they're the same contact, so a saved contact can still
+// get flagged "unsaved" under their @lid JID. See contacts.js for how
+// this map is used.
 function loadStore() {
   try {
     const raw = fs.readFileSync(STORE_FILE, 'utf-8');
@@ -75,9 +83,10 @@ function loadStore() {
     return {
       chats: new Set(data.chats || []),
       contacts: data.contacts || {},
+      lidMap: data.lidMap || {},
     };
   } catch {
-    return { chats: new Set(), contacts: {} };
+    return { chats: new Set(), contacts: {}, lidMap: {} };
   }
 }
 
@@ -86,6 +95,8 @@ const contactStore = loaded.contacts;
 // Every 1:1 chat JID we know about — this is what catches someone who
 // only ever messaged you, since they may never trigger a contacts event.
 const chatStore = loaded.chats;
+// Bidirectional: lidMap[someLidJid] = pnJid AND lidMap[somePnJid] = lidJid
+const lidMap = loaded.lidMap;
 
 let saveTimer = null;
 function saveStoreDebounced() {
@@ -95,12 +106,43 @@ function saveStoreDebounced() {
     try {
       fs.writeFileSync(
         STORE_FILE,
-        JSON.stringify({ chats: [...chatStore], contacts: contactStore })
+        JSON.stringify({ chats: [...chatStore], contacts: contactStore, lidMap })
       );
     } catch (err) {
       console.error('Failed to persist store:', err);
     }
   }, 2000); // batch rapid-fire events into one write
+}
+
+function linkLidAndPn(lidJid, pnJid) {
+  if (!lidJid || !pnJid) return;
+  if (lidMap[lidJid] === pnJid && lidMap[pnJid] === lidJid) return; // already linked
+  lidMap[lidJid] = pnJid;
+  lidMap[pnJid] = lidJid;
+  saveStoreDebounced();
+}
+
+// Pulls a lid<->pn pairing out of a contact object when Baileys gives us
+// one. Different Baileys versions expose this differently, so we check
+// a few known shapes defensively rather than assuming one.
+function harvestLidMapFromContact(c) {
+  if (!c) return;
+  const pn = c.id && c.id.endsWith('@s.whatsapp.net') ? c.id : c.phoneNumber;
+  const lid = c.lid || (c.id && c.id.endsWith('@lid') ? c.id : undefined);
+  if (pn && lid) linkLidAndPn(lid, pn);
+}
+
+// Pulls a lid<->pn pairing out of a message key when present. Baileys
+// attaches `remoteJidAlt` / `participantAlt` to messages routed through
+// the lid privacy layer, giving the "other" JID for the same chat.
+function harvestLidMapFromMessageKey(key) {
+  if (!key) return;
+  const a = key.remoteJid;
+  const b = key.remoteJidAlt;
+  if (!a || !b) return;
+  const lid = a.endsWith('@lid') ? a : b.endsWith('@lid') ? b : undefined;
+  const pn = a.endsWith('@s.whatsapp.net') ? a : b.endsWith('@s.whatsapp.net') ? b : undefined;
+  if (lid && pn) linkLidAndPn(lid, pn);
 }
 
 async function startBot() {
@@ -116,6 +158,39 @@ async function startBot() {
   });
 
   // --- Pairing code flow (no QR, no screen share needed) ---
+  // requestPairingCode() needs the underlying websocket to actually be
+  // connecting to WhatsApp's servers first — calling it too early (or
+  // on a fixed guess-timer) can fail silently on slow cold starts.
+  // Instead we wait for connection.update to tell us we're 'connecting',
+  // and retry with backoff if the request itself throws.
+  let codeRequested = false;
+  let pairingRetries = 0;
+
+  async function tryRequestPairingCode() {
+    if (codeRequested) return;
+    codeRequested = true;
+    try {
+      const code = await sock.requestPairingCode(PHONE_NUMBER);
+      console.log('\n================================');
+      console.log(' PAIRING CODE:', code);
+      console.log(' On the WhatsApp account owner\'s phone:');
+      console.log(' Settings > Linked Devices > Link a Device');
+      console.log(' > "Link with phone number instead" > enter this code');
+      console.log('================================\n');
+    } catch (err) {
+      console.error('Failed to request pairing code:', err);
+      codeRequested = false;
+      pairingRetries += 1;
+      if (pairingRetries <= 5) {
+        const delay = Math.min(3000 * pairingRetries, 15000);
+        console.log(`Retrying pairing code request in ${delay}ms (attempt ${pairingRetries}/5)...`);
+        setTimeout(tryRequestPairingCode, delay);
+      } else {
+        console.error('Giving up on pairing code after 5 attempts. Restart the process to try again.');
+      }
+    }
+  }
+
   if (!sock.authState.creds.registered) {
     if (!PHONE_NUMBER) {
       console.error(
@@ -123,35 +198,29 @@ async function startBot() {
       );
       process.exit(1);
     }
-    setTimeout(async () => {
-      try {
-        const code = await sock.requestPairingCode(PHONE_NUMBER);
-        console.log('\n================================');
-        console.log(' PAIRING CODE:', code);
-        console.log(' On the WhatsApp account owner\'s phone:');
-        console.log(' Settings > Linked Devices > Link a Device');
-        console.log(' > "Link with phone number instead" > enter this code');
-        console.log('================================\n');
-      } catch (err) {
-        console.error('Failed to request pairing code:', err);
-      }
-    }, 3000);
   }
 
   sock.ev.on('creds.update', saveCreds);
 
   // Keep our own contact map up to date (replaces the removed sock.store)
   sock.ev.on('contacts.upsert', (contacts) => {
-    for (const c of contacts) contactStore[c.id] = c;
+    for (const c of contacts) {
+      contactStore[c.id] = c;
+      harvestLidMapFromContact(c);
+    }
     saveStoreDebounced();
   });
   sock.ev.on('contacts.set', ({ contacts }) => {
-    for (const c of contacts) contactStore[c.id] = c;
+    for (const c of contacts) {
+      contactStore[c.id] = c;
+      harvestLidMapFromContact(c);
+    }
     saveStoreDebounced();
   });
   sock.ev.on('contacts.update', (updates) => {
     for (const u of updates) {
       contactStore[u.id] = { ...(contactStore[u.id] || {}), ...u };
+      harvestLidMapFromContact(contactStore[u.id]);
     }
     saveStoreDebounced();
   });
@@ -172,24 +241,39 @@ async function startBot() {
   // right after initial pairing, which is why we persist the result.
   sock.ev.on('messaging-history.set', ({ chats, contacts }) => {
     for (const c of chats || []) chatStore.add(c.id);
-    for (const c of contacts || []) contactStore[c.id] = { ...(contactStore[c.id] || {}), ...c };
+    for (const c of contacts || []) {
+      contactStore[c.id] = { ...(contactStore[c.id] || {}), ...c };
+      harvestLidMapFromContact(contactStore[c.id]);
+    }
     console.log(`History sync received: ${chats?.length || 0} chats, ${contacts?.length || 0} contacts.`);
     saveStoreDebounced();
   });
-  // Also track chat JIDs from any message we happen to see, as a fallback.
+  // Also track chat JIDs from any message we happen to see, as a fallback,
+  // and harvest lid<->pn pairings off the message key when present.
   sock.ev.on('messages.upsert', ({ messages }) => {
     for (const m of messages) {
       if (m.key?.remoteJid) chatStore.add(m.key.remoteJid);
+      harvestLidMapFromMessageKey(m.key);
     }
     saveStoreDebounced();
   });
 
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update;
+
+    if (connection === 'connecting' && !sock.authState.creds.registered && PHONE_NUMBER) {
+      tryRequestPairingCode();
+    }
+
     if (connection === 'close') {
       const shouldReconnect =
         lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log('Connection closed. Reconnecting:', shouldReconnect);
+      // Drop every listener on this dead socket before reconnecting —
+      // otherwise each reconnect stacks a fresh set of handlers on top
+      // of the old ones, and things like the "export" command end up
+      // firing once per accumulated listener.
+      sock.ev.removeAllListeners();
       if (shouldReconnect) startBot();
     } else if (connection === 'open') {
       console.log('✅ Connected to WhatsApp. Bot is live and running in the background.');
@@ -237,7 +321,7 @@ async function startBot() {
  * builds the .vcf file. Uses the tested logic in contacts.js.
  */
 async function buildUnsavedContactsVcf(sock) {
-  const unsaved = findUnsavedNumbers(chatStore, contactStore);
+  const unsaved = findUnsavedNumbers(chatStore, contactStore, lidMap);
   const content = buildVcf(unsaved);
   return { content, count: unsaved.length };
 }
