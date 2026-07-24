@@ -50,10 +50,10 @@ async function resolveIdentityJid(jid, resolveLid) {
 // Looks up a contact record for an already-resolved identity JID,
 // trying the JID itself and the plain number under both suffixes
 // (covers cases where the contact store only ever saw one form).
-function lookupContact(identityJid, number, contactStore) {
-  const candidates = [identityJid, `${number}@s.whatsapp.net`, `${number}@lid`];
+function lookupContact(identityJid, originalJid, number, contactStore) {
+  const candidates = [identityJid, originalJid, `${number}@s.whatsapp.net`, `${number}@lid`];
   for (const candidate of candidates) {
-    if (contactStore[candidate]) return contactStore[candidate];
+    if (candidate && contactStore[candidate]) return contactStore[candidate];
   }
   return {};
 }
@@ -102,7 +102,7 @@ async function findUnsavedNumbers(chatStore, contactStore, resolveLid) {
     const number = normalizeJid(identityJid);
     if (!number) continue;
 
-    const contact = lookupContact(identityJid, number, contactStore);
+    const contact = lookupContact(identityJid, jid, number, contactStore);
 
     const savedName = (contact.name || '').trim();
     const otherNames = [contact.notify, contact.pushname, contact.verifiedName, contact.shortName]
@@ -144,3 +144,4 @@ function buildVcf(unsaved) {
 }
 
 export { findUnsavedNumbers, buildVcf };
+                                                                                   
