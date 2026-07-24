@@ -166,15 +166,20 @@ async function startBot() {
   });
 
   // --- Pairing code flow (no QR, no screen share needed) ---
-  // requestPairingCode() needs the underlying websocket to actually be
-  // connecting to WhatsApp's servers first — calling it too early (or
-  // on a fixed guess-timer) can fail silently on slow cold starts.
-  // Instead we wait for connection.update to tell us we're 'connecting',
-  // and retry with backoff if the request itself throws.
+  // Requested exactly once, after a short fixed delay so the socket's
+  // handshake has time to get underway. See requestPairingCodeOnce()
+  // below for why this does NOT retry automatically.
   let codeRequested = false;
-  let pairingRetries = 0;
 
-  async function tryRequestPairingCode() {
+  // Request the pairing code EXACTLY ONCE per process run. WhatsApp
+  // treats repeated pairing-code requests for the same number in a
+  // short window as suspicious and will hard-close the session
+  // (a real logout, not a reconnectable network drop) — that's what
+  // a retry loop here was actually causing. A short fixed delay after
+  // socket creation (rather than reacting to connection.update, which
+  // can fire before the handshake is far enough along) is the pattern
+  // Baileys' own examples use, and is what this bot used originally.
+  async function requestPairingCodeOnce() {
     if (codeRequested) return;
     codeRequested = true;
     try {
@@ -184,18 +189,15 @@ async function startBot() {
       console.log(' On the WhatsApp account owner\'s phone:');
       console.log(' Settings > Linked Devices > Link a Device');
       console.log(' > "Link with phone number instead" > enter this code');
+      console.log(' This code expires in ~60 seconds — enter it promptly.');
       console.log('================================\n');
     } catch (err) {
-      console.error('Failed to request pairing code:', err);
-      codeRequested = false;
-      pairingRetries += 1;
-      if (pairingRetries <= 5) {
-        const delay = Math.min(3000 * pairingRetries, 15000);
-        console.log(`Retrying pairing code request in ${delay}ms (attempt ${pairingRetries}/5)...`);
-        setTimeout(tryRequestPairingCode, delay);
-      } else {
-        console.error('Giving up on pairing code after 5 attempts. Restart the process to try again.');
-      }
+      console.error(
+        'Failed to request pairing code:',
+        err,
+        '\nNot retrying automatically — repeated requests can get the number' +
+          ' temporarily blocked by WhatsApp. Wait a minute, then restart the process.'
+      );
     }
   }
 
@@ -206,6 +208,7 @@ async function startBot() {
       );
       process.exit(1);
     }
+    setTimeout(requestPairingCodeOnce, 3000);
   }
 
   sock.ev.on('creds.update', saveCreds);
@@ -269,20 +272,29 @@ async function startBot() {
   sock.ev.on('connection.update', (update) => {
     const { connection, lastDisconnect } = update;
 
-    if (connection === 'connecting' && !sock.authState.creds.registered && PHONE_NUMBER) {
-      tryRequestPairingCode();
-    }
-
     if (connection === 'close') {
+      const wasRegistered = sock.authState.creds.registered;
       const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        wasRegistered && lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
       console.log('Connection closed. Reconnecting:', shouldReconnect);
       // Drop every listener on this dead socket before reconnecting —
       // otherwise each reconnect stacks a fresh set of handlers on top
       // of the old ones, and things like the "export" command end up
       // firing once per accumulated listener.
       sock.ev.removeAllListeners();
-      if (shouldReconnect) startBot();
+      if (shouldReconnect) {
+        startBot();
+      } else if (!wasRegistered) {
+        // Closed before pairing finished. Don't auto-restart — that
+        // would silently fire another pairing-code request right
+        // after this one, which is what gets a number rate-limited.
+        // Restart the process manually once you've entered a code
+        // (or want to try again).
+        console.error(
+          'Connection closed before pairing completed. Not auto-restarting — ' +
+            'restart the process manually to request a new pairing code.'
+        );
+      }
     } else if (connection === 'open') {
       console.log('✅ Connected to WhatsApp. Bot is live and running in the background.');
       console.log('   Message yourself the word "export" any time to get the contact list.');
@@ -305,7 +317,13 @@ async function startBot() {
       try {
         const vcf = await buildUnsavedContactsVcf(sock);
         if (!vcf.count) {
-          await sock.sendMessage(ownJid, { text: 'No unsaved contacts found — everything is already saved!' });
+          await sock.sendMessage(ownJid, {
+            text: `No unsaved contacts found — everything is already saved!${
+              vcf.skippedUnresolvedLid
+                ? ` (Note: ${vcf.skippedUnresolvedLid} chat(s) had no linkable phone number yet and couldn't be checked — try again later.)`
+                : ''
+            }`,
+          });
           return;
         }
         await sock.sendMessage(ownJid, {
@@ -314,7 +332,11 @@ async function startBot() {
           mimetype: 'text/vcard',
         });
         await sock.sendMessage(ownJid, {
-          text: `Done! Found ${vcf.count} unsaved contact(s), labeled TV 1–${vcf.count}. Tap the file above to import.`,
+          text: `Done! Found ${vcf.count} unsaved contact(s), labeled TV 1–${vcf.count}. Tap the file above to import.${
+            vcf.skippedUnresolvedLid
+              ? ` (Skipped ${vcf.skippedUnresolvedLid} chat(s) with no linkable phone number yet — try "export" again later, they often resolve once WhatsApp syncs them.)`
+              : ''
+          }`,
         });
       } catch (err) {
         console.error('Export failed:', err);
@@ -331,7 +353,7 @@ async function startBot() {
 async function buildUnsavedContactsVcf(sock) {
   const unsaved = findUnsavedNumbers(chatStore, contactStore, lidMap);
   const content = buildVcf(unsaved);
-  return { content, count: unsaved.length };
+  return { content, count: unsaved.length, skippedUnresolvedLid: unsaved.skippedUnresolvedLid || 0 };
 }
 
 startBot().catch((err) => console.error('Failed to start bot:', err));
