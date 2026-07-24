@@ -154,7 +154,15 @@ async function startBot() {
     auth: state,
     logger: pino({ level: 'silent' }),
     printQRInTerminal: false, // we use pairing code instead of QR
-    syncFullHistory: true, // without this, only chats from the moment we connect get pushed to us
+    // IMPORTANT: full history sync loads your entire WhatsApp message
+    // history into memory at pairing time. On a real, active account
+    // this is easily enough to exceed Railway's free-tier memory limit,
+    // which gets the container OOM-killed and restarted mid-pairing —
+    // wiping auth_info before pairing can finish. We only need chat
+    // JIDs and contact names for this bot, not message content, so we
+    // leave this off. `messaging-history.set` still fires with chats
+    // and contacts either way; you just won't get old message bodies.
+    syncFullHistory: false,
   });
 
   // --- Pairing code flow (no QR, no screen share needed) ---
